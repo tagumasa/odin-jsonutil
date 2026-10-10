@@ -15,6 +15,16 @@ as_object :: proc(v: json.Value) -> (map[string]json.Value, bool) {
 	return nil, false
 }
 
+// value_str extracts a string from a String value ("" otherwise).
+value_str :: proc(v: json.Value) -> string {
+	#partial switch x in v {
+	case json.String:
+		return string(x)
+	case:
+	}
+	return ""
+}
+
 // obj_get_bool reads a boolean member (false when absent or not a bool).
 obj_get_bool :: proc(v: json.Value, key: string) -> bool {
 	if val, ok := obj_get(v, key); ok {
@@ -25,6 +35,34 @@ obj_get_bool :: proc(v: json.Value, key: string) -> bool {
 		}
 	}
 	return false
+}
+
+// value_int extracts an integer from an Integer value (0 otherwise).
+value_int :: proc(v: json.Value) -> i64 {
+	#partial switch x in v {
+	case json.Integer:
+		return i64(x)
+	case:
+	}
+	return 0
+}
+
+// value_bool extracts a bool from a Boolean value (false otherwise).
+value_bool :: proc(v: json.Value) -> bool {
+	#partial switch x in v {
+	case json.Boolean:
+		return x
+	case:
+	}
+	return false
+}
+
+// obj_get_int reads an integer member (0 when absent or not an integer).
+obj_get_int :: proc(v: json.Value, key: string) -> i64 {
+	if val, ok := obj_get(v, key); ok {
+		return value_int(val)
+	}
+	return 0
 }
 
 // as_array casts an Array value to its base dynamic array (shared).
@@ -46,6 +84,56 @@ obj_get :: proc(v: json.Value, key: string) -> (json.Value, bool) {
 		return val, true
 	}
 	return nil, false
+}
+
+// values_equal is a deep semantic comparison: objects compare by key set
+// regardless of member order, arrays by ordered elements, scalars by
+// value. Formatting differences (spacing, member order) do not count.
+values_equal :: proc(a, b: json.Value) -> bool {
+	#partial switch va in a {
+	case json.Object:
+		ma := cast(map[string]json.Value)va
+		mb, ok := as_object(b)
+		if !ok || len(ma) != len(mb) {
+			return false
+		}
+		for k, v in ma {
+			ov, found := mb[k]
+			if !found || !values_equal(v, ov) {
+				return false
+			}
+		}
+		return true
+	case json.Array:
+		da := cast([dynamic]json.Value)va
+		ab, ok := as_array(b)
+		if !ok || len(da) != len(ab) {
+			return false
+		}
+		for v, i in da {
+			if !values_equal(v, ab[i]) {
+				return false
+			}
+		}
+		return true
+	case json.String:
+		sb, ok := b.(json.String)
+		return ok && string(va) == string(sb)
+	case json.Integer:
+		ib, ok := b.(json.Integer)
+		return ok && i64(va) == i64(ib)
+	case json.Float:
+		fb, ok := b.(json.Float)
+		return ok && f64(va) == f64(fb)
+	case json.Boolean:
+		bb, ok := b.(json.Boolean)
+		return ok && bool(va) == bool(bb)
+	case json.Null:
+		_, b_nil := b.(json.Null)
+		return b_nil
+	case:
+		return false
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +176,27 @@ json_array :: proc(items: []json.Value, a: mem.Allocator) -> json.Value {
 		append(&arr, it)
 	}
 	return json.Array(arr)
+}
+
+// json_string_array builds the array in place — no intermediate
+// []json.Value left behind for the caller to remember to free.
+json_string_array :: proc(items: []string, a: mem.Allocator) -> json.Value {
+	arr := make([dynamic]json.Value, 0, len(items), a)
+	for s in items {
+		append(&arr, json_string(s))
+	}
+	return json.Array(arr)
+}
+
+// marshal_value serializes deterministically (map keys sorted) — the form
+// for anything compared, persisted, or shown to a user. Wire bodies use
+// marshal_value_unsorted below instead.
+marshal_value :: proc(v: json.Value, a := context.temp_allocator) -> string {
+	out, err := json.unparse(v, {sort_maps_by_key = true}, allocator = a)
+	if err != nil {
+		return "null"
+	}
+	return out
 }
 
 // marshal_value_unsorted is the wire serializer: JSON objects are unordered
@@ -188,6 +297,42 @@ json_quote :: proc(s: string, a := context.allocator) -> string {
 				append(&buf, hex_digit(u32(r) & 0xF))
 			} else {
 				append_quote_rune(&buf, r)
+			}
+		}
+	}
+	append(&buf, '"')
+	return string(buf[:])
+}
+
+// json_quote_bytes renders s as a JSON string literal without
+// re-encoding: valid UTF-8 renders byte-identical to json_quote, and
+// invalid UTF-8 passes through as-is rather than becoming U+FFFD — the
+// literal records the source bytes, at the cost of being invalid UTF-8
+// itself for invalid input. The form for renders whose bytes are the
+// record; everything a consumer parses back uses json_quote.
+json_quote_bytes :: proc(s: string, a := context.allocator) -> string {
+	buf := make([dynamic]u8, 0, len(s) + 2, a)
+	append(&buf, '"')
+	for c in transmute([]u8)s {
+		switch c {
+		case '"':
+			append(&buf, "\\\"")
+		case '\\':
+			append(&buf, "\\\\")
+		case '\n':
+			append(&buf, "\\n")
+		case '\r':
+			append(&buf, "\\r")
+		case '\t':
+			append(&buf, "\\t")
+		case:
+			if c < 0x20 {
+				// The C0 escape matches json_quote's \u00XX form.
+				append(&buf, "\\u00")
+				append(&buf, hex_digit(u32(c >> 4) & 0xF))
+				append(&buf, hex_digit(u32(c) & 0xF))
+			} else {
+				append(&buf, c)
 			}
 		}
 	}
